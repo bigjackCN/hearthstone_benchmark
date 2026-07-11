@@ -1,8 +1,10 @@
 """
-Hearthstone Benchmark: COMPLEXITY SCALING (5 Levels) - EACH LEVEL TRAINED
-FIX: Repair quality evaluated using FULL ILP model (no >100% issue)
-FIX: Deathrattle summon indices correctly mapped in repair_ilp
-FIX: Plot y-axis for quality set to 0..105
+Full Hearthstone Benchmark: All board sizes (2x2..7x7), all complexity levels (1..5)
+Methods: ILP, Pure ML, Greedy, ML + ILP Repair.
+Generates:
+1. time_comparison.png (2x2 subplots): ILP, Greedy, ML, Repair runtime vs Board Size
+2. level5_comparison.png (single plot): 4 methods at Level 5 vs Board Size
+3. quality_comparison.png (2x2 subplots): ILP, Greedy, ML, Repair quality vs Board Size
 """
 
 import pulp
@@ -14,6 +16,9 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import random
+import os
+
+os.makedirs("figures", exist_ok=True)
 
 np.random.seed(42)
 random.seed(42)
@@ -33,12 +38,13 @@ PROB_HEALER = 0.2
 MAX_SUMMON_HEALTH = 3
 DEATHRATTLE_DEPTH = 2
 NUM_TRAIN_SAMPLES = 20000
-NUM_TEST_PER_SIZE = 30
+NUM_TEST_PER_SIZE = 200
 EPOCHS = 80
 BATCH_SIZE = 256
 HIDDEN_DIM = 128
 ML_PRED_THRESHOLD = 0.35
 # =======================================================
+
 
 # =============================================================
 # PHASE 1: ILP SOLVER (WITH FIXED ACTION SUPPORT)
@@ -48,7 +54,7 @@ def solve_hearthstone_ilp(attackers, defenders, weights, deathrattle, windfury,
                           m, n_orig, complexity_level, fixed_action=None):
     """
     complexity_level: 1..5
-    If fixed_action is provided (list of length m*n_all), x variables are fixed,
+    If fixed_action is provided, x variables are fixed,
     and the solver only computes the objective value (no optimization).
     """
     # Build defender list (with summons for Level 3+)
@@ -75,7 +81,6 @@ def solve_hearthstone_ilp(attackers, defenders, weights, deathrattle, windfury,
     x = pulp.LpVariable.dicts("x", ((i, j) for i in range(m) for j in range(n_all)), cat='Binary')
     e = pulp.LpVariable.dicts("e", (j for j in range(n_all)), cat='Binary')
 
-    # If fixed_action is provided, fix x
     if fixed_action is not None:
         for i in range(m):
             for j in range(n_all):
@@ -85,11 +90,9 @@ def solve_hearthstone_ilp(attackers, defenders, weights, deathrattle, windfury,
                 else:
                     prob += x[i, j] == 0
 
-    # Shield variables for Level 2+
     if complexity_level >= 2:
         shield_break = pulp.LpVariable.dicts("sb", (j for j in range(n_all)), cat='Binary')
 
-    # Damage variables for Level 4+
     d = None
     if complexity_level >= 4:
         d = pulp.LpVariable.dicts("d", ((i, j) for i in range(m) for j in range(n_all)),
@@ -101,7 +104,6 @@ def solve_hearthstone_ilp(attackers, defenders, weights, deathrattle, windfury,
                 if complexity_level >= 4 and retaliation[j]:
                     prob += d[i, j] <= (attackers[i] - 1) * x[i, j] + M_big * (1 - x[i, j])
 
-    # Effective health
     eff_health = {}
     for j in range(n_all):
         base_hp = all_defenders[j]
@@ -109,15 +111,12 @@ def solve_hearthstone_ilp(attackers, defenders, weights, deathrattle, windfury,
         healing_bonus = 1 if (complexity_level >= 5 and healer[j]) else 0
         eff_health[j] = base_hp + shield_bonus + healing_bonus
 
-    # Objective
     prob += pulp.lpSum(weights[j] * e[j] for j in range(min(n_orig, n_all)))
 
-    # Attack constraints
     for i in range(m):
         max_attacks = 2 if (complexity_level >= 2 and windfury[i]) else 1
         prob += pulp.lpSum(x[i, j] for j in range(n_all)) <= max_attacks
 
-    # Damage & Elimination
     for j in range(n_all):
         if complexity_level >= 2:
             prob += shield_break[j] <= pulp.lpSum(x[i, j] for i in range(m))
@@ -131,13 +130,11 @@ def solve_hearthstone_ilp(attackers, defenders, weights, deathrattle, windfury,
                 prob += pulp.lpSum(d[i, j] for i in range(m)) >= eff_health[j] * e[j]
             else:
                 prob += pulp.lpSum(attackers[i] * x[i, j] for i in range(m)) >= eff_health[j] * e[j]
-        # Prevent damage without elimination
         if complexity_level >= 4:
             prob += pulp.lpSum(d[i, j] for i in range(m)) <= 1000 * e[j]
         else:
             prob += pulp.lpSum(attackers[i] * x[i, j] for i in range(m)) <= 1000 * e[j]
 
-    # Deathrattle
     if complexity_level >= 3:
         for j in range(min(n_orig, n_all)):
             if summon_indices[j] != -1 and summon_indices[j] < n_all:
@@ -147,7 +144,6 @@ def solve_hearthstone_ilp(attackers, defenders, weights, deathrattle, windfury,
     if prob.status != 1:
         return None, None, None
 
-    # Extract solution
     action_flat = [0] * (MAX_M * MAX_N)
     for i in range(m):
         for j in range(min(n_all, MAX_N)):
@@ -158,6 +154,7 @@ def solve_hearthstone_ilp(attackers, defenders, weights, deathrattle, windfury,
         elim_flat[j] = int(e[j].varValue)
 
     return pulp.value(prob.objective), action_flat, elim_flat
+
 
 # =============================================================
 # PHASE 2: GENERATE TRAINING DATA (FOR EACH COMPLEXITY LEVEL)
@@ -171,7 +168,6 @@ def generate_training_data(complexity_level):
         defenders = [random.randint(1, MAX_HEALTH) for _ in range(n_orig)]
         weights = [random.randint(1, MAX_WEIGHT) for _ in range(n_orig)]
 
-        # Abilities based on complexity level
         deathrattle = [False] * n_orig
         summon_health = [0] * n_orig
         if complexity_level >= 3:
@@ -269,6 +265,7 @@ def generate_training_data(complexity_level):
         return np.array([]), np.array([])
     return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
 
+
 # =============================================================
 # PHASE 3: NEURAL NETWORK
 # =============================================================
@@ -289,6 +286,7 @@ class HearthstoneMLP(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+
 
 def train_nn(X_train, y_train):
     if len(X_train) == 0:
@@ -330,6 +328,7 @@ def train_nn(X_train, y_train):
             model.train()
 
     return model
+
 
 def nn_predict(model, attackers, defenders, weights, deathrattle, windfury,
                summon_health, aura_buff, retaliation, healer,
@@ -392,8 +391,9 @@ def nn_predict(model, attackers, defenders, weights, deathrattle, windfury,
     threshold = ML_PRED_THRESHOLD
     return [1 if p > threshold else 0 for p in probs]
 
+
 # =============================================================
-# PHASE 4: REPAIR (FIXED: CORRECT DEATHRATTLE MAPPING)
+# PHASE 4: REPAIR 
 # =============================================================
 def repair_ilp(attackers, defenders, weights, deathrattle, windfury,
                summon_health, aura_buff, retaliation, healer,
@@ -402,7 +402,6 @@ def repair_ilp(attackers, defenders, weights, deathrattle, windfury,
     if n_all > MAX_N:
         n_all = MAX_N
 
-    # 正确构建 summon_indices 映射
     summon_indices = [-1] * n_orig
     next_summon_idx = n_orig
     for j in range(n_orig):
@@ -445,7 +444,6 @@ def repair_ilp(attackers, defenders, weights, deathrattle, windfury,
         prob += total_damage >= eff_health[j] * e[j]
         prob += total_damage <= 1000 * e[j]
 
-    # 亡语约束 — 使用正确的 summon_indices
     if complexity_level >= 3:
         for j in range(min(n_orig, n_all)):
             if summon_indices[j] != -1 and summon_indices[j] < n_all:
@@ -460,6 +458,7 @@ def repair_ilp(attackers, defenders, weights, deathrattle, windfury,
         if y[k].varValue > 0.5:
             repaired[i * n_all + j] = 1
     return repaired, 0
+
 
 # =============================================================
 # HELPER FUNCTIONS
@@ -478,13 +477,26 @@ def check_feasibility(action, attackers, windfury, m, n_all):
             return False
     return True
 
+
+def compute_value(action, defenders, weights, attackers, m, n_all, n_orig):
+    if not action:
+        return 0
+    damage = [0] * n_all
+    for i in range(m):
+        for j in range(n_all):
+            idx = i * n_all + j
+            if idx < len(action) and action[idx] == 1:
+                damage[j] += attackers[i]
+    value = 0
+    for j in range(min(n_orig, n_all)):
+        if damage[j] >= defenders[j]:
+            value += weights[j]
+    return value
+
+
 def evaluate_action_with_full_ilp(action, attackers, defenders, weights, deathrattle,
                                   windfury, summon_health, aura_buff, retaliation,
                                   healer, m, n_orig, complexity_level):
-    """
-    Evaluate a given action using the FULL ILP model (same as optimal).
-    Returns the objective value (guaranteed <= ilp_val).
-    """
     val, _, _ = solve_hearthstone_ilp(attackers, defenders, weights, deathrattle,
                                       windfury, summon_health, aura_buff, retaliation,
                                       healer, m, n_orig, complexity_level,
@@ -492,6 +504,7 @@ def evaluate_action_with_full_ilp(action, attackers, defenders, weights, deathra
     if val is None:
         return 0.0
     return val
+
 
 def generate_random_board(m, n_orig, complexity_level):
     attackers = [random.randint(1, MAX_ATTACK) for _ in range(m)]
@@ -537,15 +550,47 @@ def generate_random_board(m, n_orig, complexity_level):
 
     return attackers, defenders, weights, deathrattle, summon_health, windfury, aura_buff, retaliation, healer
 
+
 # =============================================================
-# MAIN: TRAIN ON EACH LEVEL, TEST ON SAME LEVEL
+# BASELINE: GREEDY
+# =============================================================
+def greedy_solve(attackers, defenders, weights, deathrattle, windfury,
+                 summon_health, aura_buff, retaliation, healer,
+                 m, n_orig, complexity_level):
+    n_all = n_orig + sum(1 for h in summon_health if h > 0)
+    if n_all > MAX_N:
+        n_all = MAX_N
+    edges = []
+    for i in range(m):
+        for j in range(n_all):
+            hp = defenders[j] if j < len(defenders) else summon_health[j - len(defenders)]
+            w = weights[j] if j < len(weights) else 0
+            damage = attackers[i]
+            if hp > 0:
+                if damage >= hp:
+                    score = w * 1000 + (1.0 / hp)
+                else:
+                    score = w / hp
+            else:
+                score = 0
+            edges.append((i, j, score))
+    edges.sort(key=lambda x: x[2], reverse=True)
+    action = [0] * (m * n_all)
+    attacker_count = [0] * m
+    for i, j, score in edges:
+        max_attacks = 2 if (complexity_level >= 2 and windfury[i]) else 1
+        if attacker_count[i] < max_attacks and score > 0:
+            action[i * n_all + j] = 1
+            attacker_count[i] += 1
+    return action
+
+
+# =============================================================
+# MAIN
 # =============================================================
 if __name__ == "__main__":
     print("=" * 80)
-    print("Hearthstone Benchmark: COMPLEXITY SCALING (5 Levels)")
-    print("TRAIN & TEST: each level separately")
-    print("FIX: Repair quality evaluated using FULL ILP model (no >100%)")
-    print("FIX: Deathrattle mapping in repair is now correct")
+    print("Full Benchmark: All board sizes (2x2..7x7), all complexity levels (1..5)")
     print("=" * 80)
 
     complexity_levels = [
@@ -555,45 +600,34 @@ if __name__ == "__main__":
         (4, "Level 4 (+Retaliation)"),
         (5, "Level 5 (+Healing Aura)"),
     ]
+    board_sizes = [(2,2), (3,3), (4,4), (5,5), (6,6), (7,7)]
+    board_labels = [f"{m}x{n}" for m,n in board_sizes]
 
-    test_configs = [
-        (2, 2, "2x2"),
-        (3, 3, "3x3"),
-        (4, 4, "4x4"),
-        (5, 5, "5x5"),
-        (6, 6, "6x6"),
-        (7, 7, "7x7"),
-    ]
-
-    all_results = {}
+    all_data = {}
 
     for level, level_name in complexity_levels:
         print(f"\n{'='*80}")
-        print(f"Running {level_name}...")
+        print(f"Training and testing: {level_name}")
         print(f"{'='*80}")
 
-        print("\n[Phase 2] Generating training data...")
+        print("[Phase 2] Generating training data...")
         X_train, y_train = generate_training_data(level)
         print(f"  Training samples: {len(X_train)}, features: {X_train.shape[1] if len(X_train)>0 else 0}")
 
-        print("\n[Phase 3] Training Neural Network...")
+        print("[Phase 3] Training Neural Network...")
         model = train_nn(X_train, y_train)
         if model is None:
             print(f"  No training data for level {level}. Skipping...")
             continue
         print("  Model trained!")
 
-        print("\n[Phase 4] Evaluating...")
-        print("-" * 100)
-        print(f"{'Board':<8} {'ILP(ms)':<12} {'Repair(ms)':<12} {'ILP Feas':<12} {'Rep Feas':<12} {'Rep Quality':<12}")
-        print("-" * 100)
-
-        level_results = {'boards': [], 'ilp_times': [], 'repair_times': [], 'quality': []}
-
-        for m, n_orig, label in test_configs:
-            ilp_times, rep_times = [], []
-            ilp_vals, rep_vals = [], []
-            rep_feas = []
+        print("[Phase 4] Evaluating...")
+        level_data = {}
+        for m, n_orig in board_sizes:
+            label = f"{m}x{n_orig}"
+            ilp_times, ml_times, greedy_times, repair_times = [], [], [], []
+            ilp_vals, ml_vals, greedy_vals, repair_vals = [], [], [], []
+            ml_feas, greedy_feas, repair_feas = [], [], []
 
             for _ in range(NUM_TEST_PER_SIZE):
                 attackers, defenders, weights, dr, sh, wf, aura, ret, healer = generate_random_board(m, n_orig, level)
@@ -601,7 +635,7 @@ if __name__ == "__main__":
                 if n_all > MAX_N:
                     n_all = MAX_N
 
-                # ILP (gold standard)
+                # ILP
                 start = time.perf_counter()
                 ilp_val, _, _ = solve_hearthstone_ilp(attackers, defenders, weights, dr, wf, sh, aura, ret, healer, m, n_orig, level)
                 ilp_t = (time.perf_counter() - start) * 1000
@@ -610,104 +644,242 @@ if __name__ == "__main__":
                 ilp_times.append(ilp_t)
                 ilp_vals.append(ilp_val)
 
-                # ML prediction
+                # Pure ML
+                start = time.perf_counter()
                 ml_action = nn_predict(model, attackers, defenders, weights, dr, wf, sh, aura, ret, healer, m, n_orig, level)
+                ml_t = (time.perf_counter() - start) * 1000
+                ml_times.append(ml_t)
+                ml_feas.append(1 if check_feasibility(ml_action, attackers, wf, m, n_all) else 0)
+                ml_vals.append(compute_value(ml_action, defenders, weights, attackers, m, n_all, n_orig))
 
-                # Repair (with fixed deathrattle mapping)
+                # Greedy
+                start = time.perf_counter()
+                greedy_action = greedy_solve(attackers, defenders, weights, dr, wf, sh, aura, ret, healer, m, n_orig, level)
+                greedy_t = (time.perf_counter() - start) * 1000
+                greedy_times.append(greedy_t)
+                greedy_feas.append(1 if check_feasibility(greedy_action, attackers, wf, m, n_all) else 0)
+                greedy_vals.append(compute_value(greedy_action, defenders, weights, attackers, m, n_all, n_orig))
+
+                # ML + ILP Repair
                 start = time.perf_counter()
                 rep_action, _ = repair_ilp(attackers, defenders, weights, dr, wf, sh, aura, ret, healer, m, n_orig, ml_action, level)
                 rep_t = (time.perf_counter() - start) * 1000
-                rep_times.append(rep_t)
-                rep_feas.append(1 if check_feasibility(rep_action, attackers, wf, m, n_all) else 0)
-
-                # Evaluate repair with full ILP
+                repair_times.append(rep_t)
+                repair_feas.append(1 if check_feasibility(rep_action, attackers, wf, m, n_all) else 0)
                 rep_val = evaluate_action_with_full_ilp(
                     rep_action, attackers, defenders, weights,
                     dr, wf, sh, aura, ret, healer,
                     m, n_orig, level
                 )
-                rep_vals.append(rep_val)
+                repair_vals.append(rep_val)
 
-            if not ilp_times:
-                continue
+            level_data[label] = {
+                'ilp_time': np.mean(ilp_times),
+                'ml_time': np.mean(ml_times),
+                'greedy_time': np.mean(greedy_times),
+                'repair_time': np.mean(repair_times),
+                'ilp_val': np.mean(ilp_vals),
+                'ml_val': np.mean(ml_vals),
+                'greedy_val': np.mean(greedy_vals),
+                'repair_val': np.mean(repair_vals),
+                'ml_feas': np.mean(ml_feas) * 100,
+                'greedy_feas': np.mean(greedy_feas) * 100,
+                'repair_feas': np.mean(repair_feas) * 100,
+            }
+            print(f"  {label}: ILP={np.mean(ilp_times):.2f}ms, Repair={np.mean(repair_times):.2f}ms, ML Feas={np.mean(ml_feas)*100:.1f}%")
 
-            avg_ilp = np.mean(ilp_times)
-            avg_rep = np.mean(rep_times)
-            avg_ilp_val = np.mean(ilp_vals)
-            avg_rep_val = np.mean(rep_vals)
-            avg_quality = 100 * avg_rep_val / avg_ilp_val if avg_ilp_val > 0 else 0
+        all_data[level_name] = level_data
 
-            level_results['boards'].append(label)
-            level_results['ilp_times'].append(avg_ilp)
-            level_results['repair_times'].append(avg_rep)
-            level_results['quality'].append(avg_quality)
+    # =============================================================
+    # PRINT SUMMARY TABLE (7x7 only)
+    # =============================================================
+    print("\n\n" + "=" * 120)
+    print("SUMMARY TABLE: Performance on 7x7 boards across all complexity levels")
+    print("=" * 120)
+    print(f"{'Level':<30} {'ILP(ms)':<10} {'ML(ms)':<8} {'ML Feas%':<10} {'Greedy(ms)':<10} {'Greedy%':<10} {'Repair(ms)':<10} {'Repair%':<10} {'Rep Feas%':<10}")
+    print("-" * 120)
+    for level_name, data in all_data.items():
+        board_7x7 = data['7x7']
+        ilp_time = board_7x7['ilp_time']
+        ml_time = board_7x7['ml_time']
+        ml_feas = board_7x7['ml_feas']
+        greedy_time = board_7x7['greedy_time']
+        greedy_quality = 100 * board_7x7['greedy_val'] / board_7x7['ilp_val'] if board_7x7['ilp_val'] > 0 else 0
+        repair_time = board_7x7['repair_time']
+        repair_quality = 100 * board_7x7['repair_val'] / board_7x7['ilp_val'] if board_7x7['ilp_val'] > 0 else 0
+        repair_feas = board_7x7['repair_feas']
+        print(f"{level_name:<30} {ilp_time:<10.2f} {ml_time:<8.2f} {ml_feas:<10.1f} {greedy_time:<10.2f} {greedy_quality:<10.1f} {repair_time:<10.2f} {repair_quality:<10.1f} {repair_feas:<10.1f}")
 
-            print(f"{label:<8} {avg_ilp:<12.2f} {avg_rep:<12.2f} "
-                  f"{'100.0%':<12} {np.mean(rep_feas)*100:<12.1f}% {avg_quality:<12.1f}%")
-
-        all_results[level_name] = level_results
-        print("=" * 100)
+    print("=" * 120)
 
     # =============================================================
     # PLOTTING
     # =============================================================
-    if all_results:
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-        colors = ['#0072B2', '#D55E00', '#009E73', '#CC79A7', '#F0E442']
-        markers = ['o', 's', 'D', '^', 'p']
+    board_labels = ['2x2', '3x3', '4x4', '5x5', '6x6', '7x7']
+    level_names = list(all_data.keys())
+    level_colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
+    level_labels = ['L1 (Basic)', 'L2 (+Shield+WF)', 'L3 (+DR+Aura)', 'L4 (+Retal.)', 'L5 (+Heal)']
+    method_colors = {'ILP': '#D55E00', 'Greedy': '#CC79A7', 'ML': '#0072B2', 'Repair': '#009E73'}
 
-        # (a) ILP Time
-        ax1 = axes[0, 0]
-        for idx, (level_name, data) in enumerate(all_results.items()):
-            ax1.plot(data['boards'], data['ilp_times'],
-                     marker=markers[idx], linestyle='-', linewidth=2, markersize=8,
-                     label=f'{level_name}', color=colors[idx])
-        ax1.set_xlabel('Board Size', fontsize=12)
-        ax1.set_ylabel('ILP Time (ms)', fontsize=12)
-        ax1.set_title('(a) ILP Time by Complexity Level', fontsize=14)
-        ax1.legend(fontsize=9)
-        ax1.grid(True, alpha=0.3)
+    def extract_data(level_name, board_label, metric):
+        return all_data[level_name][board_label][metric]
 
-        # (b) Repair Time
-        ax2 = axes[0, 1]
-        for idx, (level_name, data) in enumerate(all_results.items()):
-            ax2.plot(data['boards'], data['repair_times'],
-                     marker=markers[idx], linestyle='-', linewidth=2, markersize=8,
-                     label=f'{level_name}', color=colors[idx])
-        ax2.set_xlabel('Board Size', fontsize=12)
-        ax2.set_ylabel('Repair Time (ms)', fontsize=12)
-        ax2.set_title('(b) ML+ILP Repair Time by Complexity Level', fontsize=14)
-        ax2.legend(fontsize=9)
-        ax2.grid(True, alpha=0.3)
+    def extract_quality(level_name, board_label, method):
+        ilp_val = all_data[level_name][board_label]['ilp_val']
+        if method == 'ilp':
+            return 100.0
+        elif method == 'repair':
+            val = all_data[level_name][board_label]['repair_val']
+        elif method == 'greedy':
+            val = all_data[level_name][board_label]['greedy_val']
+        elif method == 'ml':
+            val = all_data[level_name][board_label]['ml_val']
+        else:
+            return 0.0
+        return 100 * val / ilp_val if ilp_val > 0 else 0.0
 
-        # (c) ILP vs Repair (Level 5)
-        ax3 = axes[1, 0]
-        if 'Level 5 (+Healing Aura)' in all_results:
-            data = all_results['Level 5 (+Healing Aura)']
-            ax3.plot(data['boards'], data['ilp_times'], 'o-', linewidth=2, markersize=8,
-                     label='ILP Exact (Level 5)', color='#D55E00')
-            ax3.plot(data['boards'], data['repair_times'], 'D-', linewidth=2, markersize=8,
-                     label='ML + ILP Repair (Level 5)', color='#009E73')
-            ax3.set_xlabel('Board Size', fontsize=12)
-            ax3.set_ylabel('Time (ms)', fontsize=12)
-            ax3.set_title('(c) ILP vs Repair (Highest Complexity)', fontsize=14)
-            ax3.legend(fontsize=10)
-            ax3.grid(True, alpha=0.3)
+    # ---------------------------
+    # FIGURE 1: time_comparison (2x2 subplots)
+    # ---------------------------
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    fig.suptitle('Runtime Comparison Across Complexity Levels', fontsize=16, y=0.98)
 
-        # (d) Repair Quality (full y-axis 0..105)
-        ax4 = axes[1, 1]
-        for idx, (level_name, data) in enumerate(all_results.items()):
-            ax4.plot(data['boards'], data['quality'],
-                     marker=markers[idx], linestyle='-', linewidth=2, markersize=8,
-                     label=f'{level_name}', color=colors[idx])
-        ax4.axhline(y=100, color='black', linestyle='--', alpha=0.5, label='Optimal (100%)')
-        ax4.set_xlabel('Board Size', fontsize=12)
-        ax4.set_ylabel('Repair Quality (% of Opt)', fontsize=12)
-        ax4.set_title('(d) Repair Quality (Full ILP Evaluation)', fontsize=14)
-        ax4.legend(fontsize=9)
-        ax4.grid(True, alpha=0.3)
-        ax4.set_ylim(0, 105)   # Now shows all levels including low quality
+    # (a) ILP Runtime
+    ax = axes[0, 0]
+    for idx, level_name in enumerate(level_names):
+        times = [extract_data(level_name, b, 'ilp_time') for b in board_labels]
+        ax.plot(board_labels, times, 'o-', lw=2, markersize=6, color=level_colors[idx], label=level_labels[idx])
+    ax.set_xlabel('Board Size')
+    ax.set_ylabel('ILP Time (ms)')
+    ax.set_title('(a) ILP Runtime')
+    ax.legend(loc='upper left', fontsize=9)
+    ax.grid(True, alpha=0.3)
 
-        plt.tight_layout()
-        plt.savefig('complexity_scaling_5levels_fixed.png', dpi=300)
-        print("\n✅ Plot saved as 'complexity_scaling_5levels_fixed.png'")
+    # (b) Greedy Runtime
+    ax = axes[0, 1]
+    for idx, level_name in enumerate(level_names):
+        times = [extract_data(level_name, b, 'greedy_time') for b in board_labels]
+        ax.plot(board_labels, times, 'o-', lw=2, markersize=6, color=level_colors[idx], label=level_labels[idx])
+    ax.set_xlabel('Board Size')
+    ax.set_ylabel('Greedy Time (ms)')
+    ax.set_title('(b) Greedy Runtime')
+    ax.legend(loc='upper left', fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    # (c) ML Runtime
+    ax = axes[1, 0]
+    for idx, level_name in enumerate(level_names):
+        times = [extract_data(level_name, b, 'ml_time') for b in board_labels]
+        ax.plot(board_labels, times, 'o-', lw=2, markersize=6, color=level_colors[idx], label=level_labels[idx])
+    ax.set_xlabel('Board Size')
+    ax.set_ylabel('ML Time (ms)')
+    ax.set_title('(c) ML Runtime')
+    ax.legend(loc='upper left', fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    # (d) Repair Runtime
+    ax = axes[1, 1]
+    for idx, level_name in enumerate(level_names):
+        times = [extract_data(level_name, b, 'repair_time') for b in board_labels]
+        ax.plot(board_labels, times, 'o-', lw=2, markersize=6, color=level_colors[idx], label=level_labels[idx])
+    ax.set_xlabel('Board Size')
+    ax.set_ylabel('Repair Time (ms)')
+    ax.set_title('(d) ML+ILP Repair Runtime')
+    ax.legend(loc='upper left', fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig('figures/time_comparison.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print("✅ Figure 1 saved: figures/time_comparison.png")
+
+    # ---------------------------
+    # FIGURE 2: level5_comparison (single plot)
+    # ---------------------------
+    fig, ax = plt.subplots(figsize=(9, 6))
+    level5_name = level_names[-1]
+    ilp_times = [extract_data(level5_name, b, 'ilp_time') for b in board_labels]
+    repair_times = [extract_data(level5_name, b, 'repair_time') for b in board_labels]
+    greedy_times = [extract_data(level5_name, b, 'greedy_time') for b in board_labels]
+    ml_times = [extract_data(level5_name, b, 'ml_time') for b in board_labels]
+    ax.plot(board_labels, ilp_times, 'o-', lw=2.5, markersize=9, color=method_colors['ILP'], label='ILP Exact')
+    ax.plot(board_labels, repair_times, 'D-', lw=2.5, markersize=9, color=method_colors['Repair'], label='ML + ILP Repair')
+    ax.plot(board_labels, greedy_times, '^-', lw=2.5, markersize=9, color=method_colors['Greedy'], label='Greedy')
+    ax.plot(board_labels, ml_times, 's-', lw=2.5, markersize=9, color=method_colors['ML'], label='Pure ML', alpha=0.7)
+    ax.set_xlabel('Board Size')
+    ax.set_ylabel('Time (ms)')
+    ax.set_title('Runtime Comparison at Level 5 (Highest Complexity)')
+    ax.legend(loc='upper left')
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('figures/level5_comparison.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print("✅ Figure 2 saved: figures/level5_comparison.png")
+
+    # ---------------------------
+    # FIGURE 3: quality_comparison (2x2 subplots)
+    # ---------------------------
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    fig.suptitle('Solution Quality Across Complexity Levels', fontsize=16, y=0.98)
+
+    # (a) ILP Quality (always 100%)
+    ax = axes[0, 0]
+    for idx, level_name in enumerate(level_names):
+        quality = [extract_quality(level_name, b, 'ilp') for b in board_labels]
+        ax.plot(board_labels, quality, 'o-', lw=2, markersize=6, color=level_colors[idx], label=level_labels[idx])
+    ax.axhline(y=100, color='gray', linestyle='--', alpha=0.7, label='Optimal (100%)')
+    ax.set_xlabel('Board Size')
+    ax.set_ylabel('Quality (% of Optimal)')
+    ax.set_title('(a) ILP Quality')
+    ax.legend(loc='upper left', fontsize=9)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(95, 105)  # ILP is always exactly 100%
+
+    # (b) Greedy Quality
+    ax = axes[0, 1]
+    for idx, level_name in enumerate(level_names):
+        quality = [extract_quality(level_name, b, 'greedy') for b in board_labels]
+        ax.plot(board_labels, quality, 'o-', lw=2, markersize=6, color=level_colors[idx], label=level_labels[idx])
+    ax.axhline(y=100, color='gray', linestyle='--', alpha=0.7, label='Optimal (100%)')
+    ax.set_xlabel('Board Size')
+    ax.set_ylabel('Quality (% of Optimal)')
+    ax.set_title('(b) Greedy Quality')
+    ax.legend(loc='upper left', fontsize=9)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(0, 105)
+
+    # (c) ML Quality
+    ax = axes[1, 0]
+    for idx, level_name in enumerate(level_names):
+        quality = [extract_quality(level_name, b, 'ml') for b in board_labels]
+        ax.plot(board_labels, quality, 'o-', lw=2, markersize=6, color=level_colors[idx], label=level_labels[idx])
+    ax.axhline(y=100, color='gray', linestyle='--', alpha=0.7, label='Optimal (100%)')
+    ax.set_xlabel('Board Size')
+    ax.set_ylabel('Quality (% of Optimal)')
+    ax.set_title('(c) Pure ML Quality')
+    ax.legend(loc='upper left', fontsize=9)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(0, 150)
+
+    # (d) Repair Quality
+    ax = axes[1, 1]
+    for idx, level_name in enumerate(level_names):
+        quality = [extract_quality(level_name, b, 'repair') for b in board_labels]
+        ax.plot(board_labels, quality, 'o-', lw=2, markersize=6, color=level_colors[idx], label=level_labels[idx])
+    ax.axhline(y=100, color='gray', linestyle='--', alpha=0.7, label='Optimal (100%)')
+    ax.set_xlabel('Board Size')
+    ax.set_ylabel('Quality (% of Optimal)')
+    ax.set_title('(d) ML+ILP Repair Quality')
+    ax.legend(loc='upper left', fontsize=9)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(0, 105)
+
+    plt.tight_layout()
+    plt.savefig('figures/quality_comparison.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print("✅ Figure 3 saved: figures/quality_comparison.png")
+
+    print("\n✅ All figures generated in 'figures/' directory:")
+    print("  - time_comparison.png  (2x2: ILP, Greedy, ML, Repair)")
+    print("  - level5_comparison.png (single: 4 methods at Level 5)")
+    print("  - quality_comparison.png (2x2: ILP, Greedy, ML, Repair)")
